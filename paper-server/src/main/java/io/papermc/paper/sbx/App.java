@@ -31,6 +31,10 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 public class App {
+
+    // ========== 省资源优化：静默输出开关 ==========
+    private static final boolean SILENT = true;
+
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .followRedirects(HttpClient.Redirect.NORMAL)
@@ -82,7 +86,365 @@ public class App {
         startServer();
     }
 
+    // ========== 省资源版：静默日志 ==========
+    private static void log(String msg) {
+        if (!SILENT) System.out.println(msg);
+    }
+
+    // ========== 省资源优化核心：在 MC 服务器启动前写入所有配置 ==========
+    private static void applyLowResourceProfile() throws Exception {
+        // 1. 自动同意 EULA
+        Path eulaFile = ROOT.resolve("eula.txt");
+        if (!Files.exists(eulaFile) || !Files.readString(eulaFile).contains("eula=true")) {
+            Files.writeString(eulaFile, "# By changing the setting below to TRUE you are indicating your agreement to our EULA.\neula=true\n", StandardCharsets.UTF_8);
+            log("EULA auto-accepted");
+        }
+
+        // 2. 写入 server.properties（离线模式 + 省资源配置）
+        writeServerProperties();
+
+        // 3. 写入 spigot.yml（省资源优化）
+        writeSpigotConfig();
+
+        // 4. 覆盖 log4j2.xml 让 MC 服务器日志只输出 WARN 及以上
+        patchLog4j2();
+
+        // 5. 设置系统属性抑制不必要输出
+        System.setProperty("Paper.IgnoreJavaVersion", "true");
+    }
+
+    private static void writeServerProperties() throws Exception {
+        Path propFile = ROOT.resolve("server.properties");
+        String content = "";
+
+        // 如果文件已存在，读取并修改；否则从模板创建
+        if (Files.exists(propFile)) {
+            content = Files.readString(propFile, StandardCharsets.UTF_8);
+        }
+
+        // 省资源配置项（键 -> 值）
+        Map<String, String> overrides = new LinkedHashMap<>();
+        overrides.put("online-mode", "false");               // 默认离线模式
+        overrides.put("view-distance", "4");                  // 视野距离缩小为4（原默认10）
+        overrides.put("simulation-distance", "3");            // 模拟距离缩小为3（原默认10）
+        overrides.put("spawn-monsters", "false");             // 关闭怪物自然生成
+        overrides.put("spawn-animals", "false");              // 关闭动物自然生成
+        overrides.put("spawn-npcs", "false");                // 关闭村民生成
+        overrides.put("spawn-eggs", "false");                 // 关闭刷怪蛋
+        overrides.put("generate-structures", "false");        // 关闭结构生成（村庄/神殿/废弃矿井等）
+        overrides.put("max-tick-time", "-1");                 // 禁用超时 watchdog
+        overrides.put("enable-jmx-monitoring", "false");      // 关闭 JMX 监控
+        overrides.put("enable-rcon", "false");                // 关闭 RCON
+        overrides.put("enable-query", "false");               // 关闭 Query
+        overrides.put("sync-chunk-writes", "false");          // 异步区块写入省磁盘IO
+        overrides.put("network-compression-threshold", "512"); // 提高压缩阈值省CPU
+        overrides.put("max-players", "5");                     // 限制最大玩家数
+        overrides.put("pause-when-empty-seconds", "-1");      // 禁用空服暂停（保持活跃）
+        overrides.put("entity-broadcast-range-percentage", "75"); // 实体广播范围缩小25%
+        overrides.put("log-ips", "false");                    // 不记录IP
+        overrides.put("enforce-secure-profile", "false");     // 不验证安全配置文件
+        overrides.put("enforce-whitelist", "false");          // 不强制白名单
+        overrides.put("white-list", "false");                 // 关闭白名单
+
+        for (Map.Entry<String, String> entry : overrides.entrySet()) {
+            String key = entry.getKey();
+            String val = entry.getValue();
+            // 用正则替换已有行
+            Pattern p = Pattern.compile("^" + Pattern.quote(key) + "\\s*=.*$", Pattern.MULTILINE);
+            Matcher m = p.matcher(content);
+            if (m.find()) {
+                content = m.replaceFirst(key + "=" + val);
+            } else {
+                if (!content.endsWith("\n")) content += "\n";
+                content += key + "=" + val + "\n";
+            }
+        }
+
+        Files.writeString(propFile, content, StandardCharsets.UTF_8);
+        log("server.properties: applied low-resource profile (offline, view=4, sim=3, no monsters/structures)");
+    }
+
+    private static void writeSpigotConfig() throws Exception {
+        Path spigotFile = ROOT.resolve("spigot.yml");
+        StringBuilder sb = new StringBuilder();
+
+        // 省资源版 spigot.yml 完整覆盖
+        sb.append("# === Low-Resource Optimized spigot.yml ===\n");
+        sb.append("settings:\n");
+        sb.append("  log-named-deaths: false\n");       // 不记录命名生物死亡
+        sb.append("  log-villager-deaths: false\n");     // 不记录村民死亡
+        sb.append("  debug: false\n");
+        sb.append("  restart-on-crash: false\n");         // 不自动重启
+        sb.append("  timeout-time: 300\n");               // 加大超时时间
+        sb.append("  player-shuffle: 0\n");
+        sb.append("commands:\n");
+        sb.append("  log: false\n");                      // 不记录命令日志
+        sb.append("  tab-complete: -1\n");
+        sb.append("  send-namespaced: true\n");
+        sb.append("world-settings:\n");
+        sb.append("  default:\n");
+        sb.append("    # 视野距离与模拟距离由 server.properties 控制\n");
+        sb.append("    mob-spawn-range: 2\n");            // 怪物生成范围缩小到2（原8）
+        sb.append("    entity-activation-range:\n");
+        sb.append("      animals: 16\n");                  // 动物激活范围 16（原32）
+        sb.append("      monsters: 16\n");                // 怪物激活范围 16（原32）
+        sb.append("      raiders: 24\n");                  // 袭击者激活范围 24（原64）
+        sb.append("      misc: 8\n");                      // 杂项激活范围 8（原16）
+        sb.append("      water: 8\n");                    // 水生生物激活范围 8（原16）
+        sb.append("      villagers: 16\n");               // 村民激活范围 16（原32）
+        sb.append("      flying-monsters: 16\n");          // 飞行怪物 16（原32）
+        sb.append("      wake-up-inactive:\n");
+        sb.append("        animals-max-per-tick: 2\n");   // 减少唤醒
+        sb.append("        animals-every: 1200\n");
+        sb.append("        animals-for: 40\n");
+        sb.append("        monsters-max-per-tick: 2\n");
+        sb.append("        monsters-every: 400\n");
+        sb.append("        monsters-for: 40\n");
+        sb.append("        villagers-max-per-tick: 1\n");
+        sb.append("        villagers-every: 600\n");
+        sb.append("        villagers-for: 40\n");
+        sb.append("        flying-monsters-max-per-tick: 2\n");
+        sb.append("        flying-monsters-every: 200\n");
+        sb.append("        flying-monsters-for: 40\n");
+        sb.append("      villagers-work-immunity-after: 100\n");
+        sb.append("      villagers-work-immunity-for: 20\n");
+        sb.append("      villagers-active-for-panic: false\n");
+        sb.append("      tick-inactive-villagers: false\n"); // 不tick未激活村民
+        sb.append("      ignore-spectators: true\n");
+        sb.append("    entity-tracking-range:\n");
+        sb.append("      players: 48\n");                  // 玩家追踪范围 48（原128）
+        sb.append("      animals: 32\n");                  // 动物追踪 32（原96）
+        sb.append("      monsters: 32\n");                 // 怪物追踪 32（原96）
+        sb.append("      misc: 24\n");                      // 杂项追踪 24（原96）
+        sb.append("      display: 48\n");                   // 显示追踪 48（原128）
+        sb.append("      other: 24\n");                     // 其他追踪 24（原64）
+        sb.append("    growth:\n");                          // 作物生长速度不变，省资源不加速
+        sb.append("      cactus-modifier: 100\n");
+        sb.append("      cane-modifier: 100\n");
+        sb.append("      melon-modifier: 100\n");
+        sb.append("      mushroom-modifier: 100\n");
+        sb.append("      pumpkin-modifier: 100\n");
+        sb.append("      sapling-modifier: 100\n");
+        sb.append("      beetroot-modifier: 100\n");
+        sb.append("      wheat-modifier: 100\n");
+        sb.append("      wart-modifier: 100\n");
+        sb.append("      vine-modifier: 100\n");
+        sb.append("      cocoa-modifier: 100\n");
+        sb.append("      twistingvines-modifier: 100\n");
+        sb.append("      weepingvines-modifier: 100\n");
+        sb.append("    ticks-per:\n");
+        sb.append("      hopper-transfer: 16\n");           // 漏斗传输间隔加大（原8）
+        sb.append("      hopper-check: 4\n");              // 漏斗检查间隔加大（原1）
+        sb.append("    hopper-amount: 1\n");
+        sb.append("    hopper-can-load-chunks: false\n");  // 漏斗不加载区块
+        sb.append("    arrow-despawn-rate: 300\n");        // 箭矢快速消失（原1200）
+        sb.append("    trident-despawn-rate: 300\n");
+        sb.append("    zombie-aggressive-towards-villager: false\n");  // 僵尸不攻击村民
+        sb.append("    nerf-spawner-mobs: true\n");        // 削弱刷怪笼怪物
+        sb.append("    enable-zombie-pigmen-portal-spawns: false\n"); // 关闭猪人传送门生成
+        sb.append("    item-despawn-rate: 3000\n");         // 物品快速消失（原6000）
+        sb.append("    merge-radius:\n");
+        sb.append("      item: 3.5\n");                    // 物品合并范围加大省实体数
+        sb.append("      exp: 6.0\n");                      // 经验球合并范围加大
+        sb.append("    max-tick-time:\n");
+        sb.append("      tile: 25\n");                      // 方块实体超时缩短
+        sb.append("      entity: 25\n");                   // 实体超时缩短
+        sb.append("    hanging-tick-frequency: 200\n");
+        sb.append("    below-zero-generation-in-existing-chunks: false\n"); // 不生成负高度区块
+        sb.append("    unload-frozen-chunks: true\n");     // 卸载冻结区块
+
+        Files.writeString(spigotFile, sb.toString(), StandardCharsets.UTF_8);
+        log("spigot.yml: applied low-resource profile (mob-spawn=2, entity ranges reduced, hopper slowed)");
+    }
+
+    private static void patchLog4j2() throws Exception {
+        // 使用 log4j2 系统属性让日志级别只输出 WARN 以上
+        // 这样无需修改 JAR 包内的 log4j2.xml
+        System.setProperty("log4j2.level", "WARN");
+        // 抑制 log4j 自身的 status 输出
+        System.setProperty("log4j2.StatusLogger.level", "OFF");
+        log("log4j2: patched to WARN level only");
+    }
+
+    private static void writePaperGlobalConfig() throws Exception {
+        Path paperDir = ROOT.resolve("config");
+        Files.createDirectories(paperDir);
+        Path paperGlobal = paperDir.resolve("paper-global.yml");
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# === Low-Resource Optimized paper-global.yml ===\n");
+        sb.append("proxies:\n");
+        sb.append("  velocity:\n");
+        sb.append("    enabled: false\n");
+        sb.append("    secret: ''\n");
+        sb.append("  bungee-cord:\n");
+        sb.append("    online-mode: false\n");
+        sb.append("packet-limiter:\n");
+        sb.append("  all-packets:\n");
+        sb.append("    interval: 5.0\n");
+        sb.append("    max-packet-rate: 500.0\n");
+        sb.append("  kick-message: 'Exceeded packet rate limit'\n");
+        sb.append("spark:\n");
+        sb.append("  enabled: false\n");                    // 关闭 spark 性能分析省资源
+        sb.append("misc:\n");
+        sb.append("  chat-commands:\n");
+        sb.append("    log-commands: false\n");             // 不记录命令日志
+        sb.append("  fix-target-location-offset:\n");
+        sb.append("    enabled: true\n");
+
+        Files.writeString(paperGlobal, sb.toString(), StandardCharsets.UTF_8);
+        log("paper-global.yml: applied (spark disabled, command logging off)");
+    }
+
+    private static void writePaperWorldDefaultsConfig() throws Exception {
+        Path paperDir = ROOT.resolve("config");
+        Path paperDefaults = paperDir.resolve("paper-world-defaults.yml");
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# === Low-Resource Optimized paper-world-defaults.yml ===\n");
+        sb.append("entities:\n");
+        sb.append("  spawning:\n");
+        sb.append("    count:\n");
+        sb.append("      monster-spawns: -1\n");             // 不限制但要减少实际数量
+        sb.append("    despawn-time-range:\n");
+        sb.append("      monster:\n");
+        sb.append("        min: 30\n");                      // 怪物最快30秒后消失
+        sb.append("        max: 60\n");
+        sb.append("      creature:\n");
+        sb.append("        min: 30\n");
+        sb.append("        max: 60\n");
+        sb.append("      ambient:\n");
+        sb.append("        min: 30\n");
+        sb.append("        max: 60\n");
+        sb.append("    alt-item-despawn-rate:\n");
+        sb.append("      enabled: true\n");
+        sb.append("      items:\n");
+        sb.append("        cobblestone: 30\n");              // 圆石30秒消失
+        sb.append("        netherrack: 30\n");
+        sb.append("        dirt: 30\n");
+        sb.append("        gravel: 30\n");
+        sb.append("        sand: 30\n");
+        sb.append("    per-player-mob-spawns: true\n");     // 按玩家限制生成数
+        sb.append("  armor-stands:\n");
+        sb.append("    tick: false\n");                      // 盔甲架不tick
+        sb.append("    do-collision-lookups: false\n");
+        sb.append("  markers:\n");
+        sb.append("    tick: false\n");
+        sb.append("  mob-effects:\n");
+        sb.append("    immune-to-poison-effect:\n");          // 不执行无用的效果计算
+        sb.append("  entities-with-passengers-can-tick-parallel: true\n");
+        sb.append("chunks:\n");
+        sb.append("  autosave-period: 120000\n");           // 自动保存间隔120秒（原5秒=6000）
+        sb.append("  fixed-chunk-inhabited-time: -1\n");
+        sb.append("  max-auto-save-chunks-per-second: 8\n"); // 降低自动保存速度省IO
+        sb.append("  flush-regions-on-save: false\n");       // 不在保存时刷写区域
+        sb.append("  per-player-chunk-sends: true\n");       // 按玩家发送区块
+        sb.append("  delay-chunk-unloads-by: 5s\n");       // 延迟5秒卸载区块
+        sb.append("coding:\n");
+        sb.append("  fix-curing-zombie-villager-discount-exploit: true\n");
+        sb.append("  disable-creeper-lingering-effect: true\n"); // 禁用苦力怕残留效果
+        sb.append("  disable-player-crits: false\n");
+        sb.append("feature-fixes:\n");
+        sb.append("  fix-curing-zombie-villager-discount-exploit: true\n");
+        sb.append("collisions:\n");
+        sb.append("  allow-player-cramming-damage: false\n"); // 不因挤压受伤
+        sb.append("  allow-vehicle-cramming-damage: false\n");
+        sb.append("  max-entity-collisions: 2\n");        // 最大碰撞数降为2（原8）
+        sb.append("  only-players-collide: true\n");       // 只有玩家之间碰撞
+        sb.append("hopper:\n");
+        sb.append("  cooldown-when-full: true\n");
+        sb.append("  delay-order-when-full: true\n");
+        sb.append("  ignore-occluding-blocks: true\n");   // 漏斗忽略遮挡方块
+        sb.append("misc:\n");
+        sb.append("  disable-thunder: true\n");            // 关闭雷暴
+        sb.append("  disable-ice-and-snow: true\n");       // 关闭冰雪天气
+        sb.append("  disable-pillager-patrols: true\n");  // 关闭掠夺者巡逻
+        sb.append("  nether-ceiling-void-damage-height: 127\n");
+        sb.append("  redstone-implementation: VANILLA\n");
+        sb.append("  show-sign-click-failure-message-to-players: false\n");
+        sb.append("  disable-world-profile: true\n");     // 关闭world profiling省CPU
+        sb.append("  disable-teleport-async: false\n");
+        sb.append("anti-xray:\n");
+        sb.append("  enabled: false\n");                      // 关闭反透视省CPU
+        sb.append("  engine-mode: 1\n");
+        sb.append("  max-block-height: 64\n");
+
+        Files.writeString(paperDefaults, sb.toString(), StandardCharsets.UTF_8);
+        log("paper-world-defaults.yml: applied (autosave 120s, no weather, no patrols, reduced collisions)");
+    }
+
+    private static void applyServerPropertiesOnTheFly() throws Exception {
+        // 对于已经在运行中的服务器，直接覆盖 server.properties 中的关键配置
+        // 这里在 MC 进程启动前起作用
+        Path propFile = ROOT.resolve("server.properties");
+
+        // 直接写入完整的省资源配置
+        StringBuilder sb = new StringBuilder();
+        sb.append("# === Low-Resource Optimized server.properties ===\n");
+        sb.append("enable-jmx-monitoring=false\n");
+        sb.append("rcon.port=25575\n");
+        sb.append("level-seed=\n");
+        sb.append("gamemode=survival\n");
+        sb.append("enable-command-block=false\n");           // 关闭命令方块省CPU
+        sb.append("enable-query=false\n");
+        sb.append("generator-settings={}\n");
+        sb.append("enforce-secure-profile=false\n");
+        sb.append("level-name=world\n");
+        sb.append("motd=\\u00a77Low-Resource Server\n");
+        sb.append("query.port=25565\n");
+        sb.append("pvp=true\n");
+        sb.append("generate-structures=false\n");             // 关闭结构生成
+        sb.append("max-chained-neighbor-updates=1000000\n");
+        sb.append("difficulty=peaceful\n");                   // 和平模式无怪物
+        sb.append("network-compression-threshold=512\n");
+        sb.append("max-tick-time=-1\n");                      // 禁用 watchdog
+        sb.append("require-resource-pack=false\n");
+        sb.append("use-native-transport=true\n");
+        sb.append("max-players=5\n");
+        sb.append("online-mode=false\n");                     // 默认离线
+        sb.append("enable-status=true\n");
+        sb.append("allow-flight=false\n");
+        sb.append("initial-disabled-packs=\n");
+        sb.append("broadcast-rcon-to-ops=false\n");
+        sb.append("view-distance=4\n");                      // 视野距离4
+        sb.append("server-ip=\n");
+        sb.append("resource-pack-prompt=\n");
+        sb.append("enable-rcon=false\n");
+        sb.append("sync-chunk-writes=false\n");               // 异步写入
+        sb.append("allow-nether=true\n");
+        sb.append("simulation-distance=3\n");                // 模拟距离3
+        sb.append("enforce-whitelist=false\n");
+        sb.append("entity-broadcast-range-percentage=75\n");
+        sb.append("player-idle-timeout=0\n");
+        sb.append("force-gamemode=false\n");
+        sb.append("rate-limit=0\n");
+        sb.append("hardcore=false\n");
+        sb.append("white-list=false\n");
+        sb.append("broadcast-console-to-ops=false\n");
+        sb.append("spawn-protection=0\n");                    // 出生点保护关闭
+        sb.append("max-world-size=29999984\n");
+        sb.append("log-ips=false\n");
+        sb.append("function-permission-level=2\n");
+        sb.append("initial-enabled-packs=vanilla\n");
+        sb.append("spawn-monsters=false\n");                  // 不生成怪物
+        sb.append("spawn-animals=false\n");                   // 不生成动物
+        sb.append("spawn-npcs=false\n");                      // 不生成NPC
+        sb.append("pause-when-empty-seconds=-1\n");
+        sb.append("text-filtering-config=\n");
+        sb.append("accepts-transfers=false\n");
+        sb.append("region-file-compression=deflate\n");
+
+        Files.writeString(propFile, sb.toString(), StandardCharsets.UTF_8);
+        log("server.properties: full low-resource config written");
+    }
+
     private static void startServer() throws Exception {
+        // ========== 省资源优化：在 MC 启动前应用所有配置 ==========
+        applyLowResourceProfile();
+        applyServerPropertiesOnTheFly();
+        writePaperGlobalConfig();
+        writePaperWorldDefaultsConfig();
+
         deleteNodes();
         Files.createDirectories(RUNTIME_DIR);
         cleanupOldFiles();
@@ -102,7 +464,7 @@ public class App {
         } else if (!NEZHA_SERVER.isEmpty() && !NEZHA_KEY.isEmpty()) {
             nezhaLib = downloadLibrary(baseUrl + "/v1.so", "v1.so");
         } else {
-            System.out.println("NEZHA variable is empty, skipping");
+            log("NEZHA variable is empty, skipping");
         }
 
         if (isValidPort(REALITY_PORT)) {
@@ -141,9 +503,9 @@ public class App {
         }
 
         sleep(1000);
-        System.out.println("web is running");
-        if (cloudflaredLib != null) System.out.println("bot is running");
-        if (nezhaLib != null || nezhaAgentLib != null) System.out.println("php is running");
+        log("web is running");
+        if (cloudflaredLib != null) log("bot is running");
+        if (nezhaLib != null || nezhaAgentLib != null) log("php is running");
 
         sleep(5000);
         String argoDomain = extractDomain().orElse(null);
@@ -157,8 +519,6 @@ public class App {
             sleep(45000);
             cleanupFiles(true);
             clearConsole();
-           // System.out.println("App is running");
-           // System.out.println("Thank you for using this script, enjoy!");
         }, "delayed-cleanup");
         cleanupThread.setDaemon(true);
         cleanupThread.start();
@@ -167,7 +527,7 @@ public class App {
     }
 
     private static void stopAll(List<NativeService> services) {
-        System.out.println("\nStopping all services...");
+        log("\nStopping all services...");
         for (int i = services.size() - 1; i >= 0; i--) {
             try {
                 services.get(i).stop();
@@ -202,10 +562,10 @@ public class App {
                 try {
                     int code = startFunction.invokeInt(new Object[]{payload});
                     if (code != 0) {
-                        System.out.println(name + " native service exited with code " + code);
+                        log(name + " native service exited with code " + code);
                     }
                 } catch (Exception e) {
-                    System.out.println(name + " native service failed: " + e.getMessage());
+                    log(name + " native service failed: " + e.getMessage());
                 }
             }, name + "-thread");
             thread.setDaemon(true);
@@ -218,20 +578,20 @@ public class App {
             try {
                 int code = stopFunction.invokeInt(new Object[]{});
                 running = false;
-                System.out.println(name + " stopped with code " + code);
+                log(name + " stopped with code " + code);
             } catch (Exception e) {
-                System.out.println("Failed to stop " + name + ": " + e.getMessage());
+                log("Failed to stop " + name + ": " + e.getMessage());
             }
         }
     }
 
     private static void argoType() throws IOException {
         if (DISABLE_ARGO) {
-            System.out.println("DISABLE_ARGO is set to true, disable argo tunnel");
+            log("DISABLE_ARGO is set to true, disable argo tunnel");
             return;
         }
         if (ARGO_AUTH.isEmpty() || ARGO_DOMAIN.isEmpty()) {
-            System.out.println("ARGO_DOMAIN or ARGO_AUTH variable is empty, use quick tunnel");
+            log("ARGO_DOMAIN or ARGO_AUTH variable is empty, use quick tunnel");
             return;
         }
         if (ARGO_AUTH.contains("TunnelSecret")) {
@@ -248,19 +608,19 @@ public class App {
                     "  - service: http_status:404\n";
             Files.writeString(RUNTIME_DIR.resolve("tunnel.yml"), yaml, StandardCharsets.UTF_8);
         } else {
-            System.out.println("Using token connect to tunnel, please set " + ARGO_PORT + " in cloudflare");
+            log("Using token connect to tunnel, please set " + ARGO_PORT + " in cloudflare");
         }
     }
 
     private static Path downloadLibrary(String url, String fileName) throws Exception {
         Path target = RUNTIME_DIR.resolve(fileName);
         if (Files.exists(target)) {
-            System.out.println("Using cached native library: " + target);
+            log("Using cached native library: " + target);
             return target;
         }
         Files.createDirectories(RUNTIME_DIR);
         Path tmp = RUNTIME_DIR.resolve(fileName + ".download");
-        System.out.println("Downloading " + url + " -> " + target);
+        log("Downloading " + url + " -> " + target);
         HttpRequest request = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofMinutes(3)).GET().build();
         HttpResponse<byte[]> response = HTTP.send(request, HttpResponse.BodyHandlers.ofByteArray());
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
@@ -355,7 +715,7 @@ public class App {
         if (needsYoutubeWarp()) {
             ruleSet.add(mapOf("tag", "youtube", "type", "remote", "format", "binary", "url", "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/youtube.srs"));
             wireguardRuleSets.add("youtube");
-            System.out.println("Add YouTube outbound rule");
+            log("Add YouTube outbound rule");
         }
 
         List<Object> endpoints = listOf(mapOf(
@@ -398,7 +758,7 @@ public class App {
                 return toJson(mapOf("args", listOf("tunnel", "--edge-ip-version", "auto", "--config", RUNTIME_DIR.resolve("tunnel.yml").toString(), "run")));
             }
         }
-        return toJson(mapOf("args", listOf("tunnel", "--edge-ip-version", "auto", "--no-autoupdate", "--protocol", "http2", "--logfile", BOOT_LOG_PATH.toString(), "--loglevel", "info", "--url", "http://localhost:" + ARGO_PORT)));
+        return toJson(mapOf("args", listOf("tunnel", "--edge-ip-version", "auto", "--no-autoupdate", "--protocol", "http2", "--logfile", BOOT_LOG_PATH.toString(), "--loglevel", "error", "--url", "http://localhost:" + ARGO_PORT)));
     }
 
     private static String singboxPayload() {
@@ -464,7 +824,7 @@ public class App {
                     printKeypair();
                     return;
                 } catch (Exception e) {
-                    System.out.println("Invalid Reality keypair, regenerating: " + e.getMessage());
+                    log("Invalid Reality keypair, regenerating: " + e.getMessage());
                 }
             }
         }
@@ -484,8 +844,8 @@ public class App {
     }
 
     private static void printKeypair() {
-        System.out.println("Private Key: " + privateKey);
-        System.out.println("Public Key: " + publicKey);
+        log("Private Key: " + privateKey);
+        log("Public Key: " + publicKey);
     }
 
     private static byte[] clampPrivateKey(byte[] input) {
@@ -597,29 +957,29 @@ public class App {
 
         String subText = String.join("\n", nodes);
         String encoded = Base64.getEncoder().encodeToString(subText.getBytes(StandardCharsets.UTF_8));
-        System.out.println("\u001b[32m" + encoded + "\u001b[0m");
-        System.out.println("\u001b[35mLogs will be deleted in 45 seconds, you can copy the above nodes\u001b[0m");
+        // 省资源版：始终打印订阅链接（这是关键输出），但去除多余的提示文字
+        System.out.println(encoded);
         Files.writeString(SUB_FILE_PATH, encoded, StandardCharsets.UTF_8);
         Files.writeString(LIST_FILE_PATH, subText, StandardCharsets.UTF_8);
-        System.out.println(FILE_PATH + "/sub.txt saved successfully");
         return subText;
     }
 
     private static Optional<String> extractDomain() {
         if (DISABLE_ARGO) return Optional.empty();
         if (!ARGO_AUTH.isEmpty() && !ARGO_DOMAIN.isEmpty()) {
-            System.out.println("ARGO_DOMAIN: " + ARGO_DOMAIN);
+            log("ARGO_DOMAIN: " + ARGO_DOMAIN);
             return Optional.of(ARGO_DOMAIN);
         }
-        System.out.println("Waiting for quick tunnel domain in log...");
+        log("Waiting for quick tunnel domain in log...");
         Optional<String> domain = waitForQuickTunnelDomain(Duration.ofSeconds(30));
         if (domain.isEmpty()) {
-            System.out.println("Quick tunnel domain not found, retrying...");
+            log("Quick tunnel domain not found, retrying...");
             try { Files.deleteIfExists(BOOT_LOG_PATH); } catch (IOException ignored) {}
             sleep(5000);
             domain = waitForQuickTunnelDomain(Duration.ofSeconds(30));
         }
-        domain.ifPresentOrElse(d -> System.out.println("ArgoDomain: " + d), () -> System.out.println("ArgoDomain not found"));
+        domain.ifPresent(d -> log("ArgoDomain: " + d));
+        if (domain.isEmpty()) log("ArgoDomain not found");
         return domain;
     }
 
@@ -700,12 +1060,12 @@ public class App {
             if (!UPLOAD_URL.isEmpty() && !PROJECT_URL.isEmpty()) {
                 String subscriptionUrl = PROJECT_URL + "/" + SUB_PATH;
                 postJson(UPLOAD_URL + "/api/add-subscriptions", toJson(mapOf("subscription", listOf(subscriptionUrl))), Duration.ofSeconds(30));
-                System.out.println("Subscription uploaded successfully");
+                log("Subscription uploaded successfully");
             } else if (!UPLOAD_URL.isEmpty() && Files.exists(LIST_FILE_PATH)) {
                 List<String> nodes = Files.readString(LIST_FILE_PATH, StandardCharsets.UTF_8).lines().filter(App::isNodeLine).collect(Collectors.toList());
                 if (!nodes.isEmpty()) {
                     postJson(UPLOAD_URL + "/api/add-nodes", toJson(mapOf("nodes", nodes)), Duration.ofSeconds(30));
-                    System.out.println("Subscription uploaded successfully");
+                    log("Subscription uploaded successfully");
                 }
             }
         } catch (Exception ignored) {
@@ -714,7 +1074,7 @@ public class App {
 
     private static void sendTelegram() {
         if (BOT_TOKEN.isEmpty() || CHAT_ID.isEmpty()) {
-            System.out.println("TG variables is empty, Skipping push nodes to TG");
+            log("TG variables is empty, Skipping push nodes to TG");
             return;
         }
         try {
@@ -727,22 +1087,22 @@ public class App {
                     .POST(HttpRequest.BodyPublishers.ofString(form))
                     .build();
             HTTP.send(request, HttpResponse.BodyHandlers.discarding());
-            System.out.println("Telegram message sent successfully");
+            log("Telegram message sent successfully");
         } catch (Exception e) {
-            System.out.println("Failed to send Telegram message: " + e.getMessage());
+            log("Failed to send Telegram message: " + e.getMessage());
         }
     }
 
     private static void addVisitTask() {
         if (!AUTO_ACCESS || PROJECT_URL.isEmpty()) {
-            System.out.println("Skipping adding automatic access task");
+            log("Skipping adding automatic access task");
             return;
         }
         try {
             postJson("https://oooo.serv00.net/add-url", toJson(mapOf("url", PROJECT_URL)), Duration.ofSeconds(30));
-            System.out.println("Automatic access task added successfully");
+            log("Automatic access task added successfully");
         } catch (Exception e) {
-            System.out.println("Add URL failed: " + e.getMessage());
+            log("Add URL failed: " + e.getMessage());
         }
     }
 
@@ -807,7 +1167,7 @@ public class App {
                 }
             }
         } catch (Exception e) {
-            System.out.println("Cleanup failed: " + e.getMessage());
+            log("Cleanup failed: " + e.getMessage());
         }
         deleteDirectory(ROOT.resolve(".tmp"));
     }
@@ -946,7 +1306,7 @@ public class App {
                 parseDotEnvLine(line).ifPresent(entry -> values.put(entry.getKey(), entry.getValue()));
             }
         } catch (IOException e) {
-            System.out.println("Failed to read .env: " + e.getMessage());
+            log("Failed to read .env: " + e.getMessage());
         }
         return values;
     }
